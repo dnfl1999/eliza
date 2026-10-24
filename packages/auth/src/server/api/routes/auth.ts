@@ -5506,6 +5506,11 @@ auth.post("/sms/send", async (c) => {
     trustedClientIp(c),
   );
   if (!captcha.ok) {
+    if (captcha.status === 503)
+      logger.error(
+        { reason: "sms_captcha_not_configured", requestId: c.get("requestId") },
+        "[Login] SMS request failed",
+      );
     return c.json<ApiResponse>(
       { ok: false, error: captcha.error },
       captcha.status as 400 | 502 | 503,
@@ -5534,6 +5539,13 @@ auth.post("/sms/send", async (c) => {
     ));
   } catch (err) {
     if (err instanceof Error && err.message === "SMS provider not configured") {
+      logger.error(
+        {
+          reason: "sms_provider_not_configured",
+          requestId: c.get("requestId"),
+        },
+        "[Login] SMS request failed",
+      );
       return c.json<ApiResponse>(
         { ok: false, error: "SMS provider not configured" },
         503,

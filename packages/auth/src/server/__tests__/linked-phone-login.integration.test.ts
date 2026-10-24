@@ -1,5 +1,5 @@
 /** Real identity router and PGlite; only SMS delivery is captured locally. */
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import type { createLoginApp } from "../app";
 import type { createPGLiteDb } from "../db/pglite";
@@ -58,6 +58,233 @@ function post(path: string, body: object) {
     body: JSON.stringify(body),
   });
 }
+
+test("SMS send failures record a bounded cause and request ID without provider secrets", async () => {
+  const { logger } = await import("@elizaos/core");
+  const { releaseAuthStores } = await import("../api/services/auth-lifecycle");
+  const originalFetch = globalThis.fetch;
+  const env = {
+    SMS_PROVIDER: "blooio",
+    BLOOIO_API_KEY: "synthetic-sms-key-do-not-log",
+    BLOOIO_FROM_NUMBER: "+14155550100",
+    STEWARD_SMS_SEND_GLOBAL_MAX_PER_HOUR: "0",
+  };
+  const saved = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
+  const secretBody = "synthetic-provider-secret OTP 654321 +14155550188";
+  const sentCodes: string[] = [];
+  let providerResponse = () => new Response(secretBody, { status: 429 });
+  const provider = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async (request) => {
+      const body = await request.json();
+      sentCodes.push(body.text.match(/\b\d{6}\b/u)?.[0]);
+      return providerResponse();
+    },
+  });
+  // Exercise the real provider and HTTP stack; only its fixed destination is local.
+  globalThis.fetch = ((input, init) => {
+    if (String(input) !== "https://api.blooio.com/v4/messages")
+      throw new Error("Unexpected test network destination");
+    return originalFetch(provider.url, init);
+  }) as typeof fetch;
+  const errors = spyOn(logger, "error");
+  const warnings = spyOn(logger, "warn");
+  Object.assign(process.env, env);
+  releaseAuthStores();
+  const expected = [
+    "sms_provider_rejected",
+    "sms_provider_unconfirmed",
+    "sms_delivery_failed",
+  ];
+  const observed: unknown[][] = [];
+  const allCalls: unknown[] = [];
+  try {
+    providerResponse = () => Response.json({ id: "local-accepted-message" });
+    const accepted = await post("/auth/sms/send", {
+      phone: "+14155550189",
+      tenantId,
+    });
+    expect(accepted.status).toBe(200);
+    expect((await accepted.json()).ok).toBe(true);
+    expect(errors.mock.calls).toHaveLength(0);
+    providerResponse = () => new Response(secretBody, { status: 429 });
+    for (const [index, reason] of expected.entries()) {
+      if (index === 1)
+        providerResponse = () => Response.json({ error: secretBody });
+      if (index === 2) await provider.stop(true);
+      errors.mockClear();
+      const requestId = `sms-diagnostic-${index}`;
+      const response = await app.request(
+        "https://login.example.test/auth/sms/send",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Request-Id": requestId,
+          },
+          body: JSON.stringify({ phone: `+1415555018${index}`, tenantId }),
+        },
+      );
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({
+        ok: false,
+        error: "SMS verification is temporarily unavailable",
+      });
+      expect(response.headers.get("X-Request-Id")).toBe(requestId);
+      observed.push([
+        errors.mock.calls.filter(
+          (call) => call[1] === "[Login] SMS request failed",
+        ),
+        { reason, requestId },
+      ]);
+      allCalls.push(...errors.mock.calls);
+    }
+    const allDiagnostics = JSON.stringify([allCalls, warnings.mock.calls]);
+    expect(sentCodes).toHaveLength(3);
+    for (const code of sentCodes) expect(code).toMatch(/^\d{6}$/u);
+    for (const secret of [
+      env.BLOOIO_API_KEY,
+      env.BLOOIO_FROM_NUMBER,
+      secretBody,
+      "654321",
+      "+1415555018",
+      ...sentCodes,
+    ])
+      expect(allDiagnostics).not.toContain(secret);
+    for (const [calls, context] of observed)
+      expect(calls).toEqual([[context, "[Login] SMS request failed"]]);
+  } finally {
+    errors.mockRestore();
+    warnings.mockRestore();
+    globalThis.fetch = originalFetch;
+    await provider.stop(true);
+    releaseAuthStores();
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("SMS configuration and send-budget failures have distinct request diagnostics", async () => {
+  const { logger } = await import("@elizaos/core");
+  const { releaseAuthStores } = await import("../api/services/auth-lifecycle");
+  const { setDatabaseAuthRateLimiter } = await import(
+    "../api/services/auth-rate-limit"
+  );
+  const { checkDatabaseAuthRateLimit } = await import(
+    "../auth/database-rate-limit"
+  );
+  const { tenants, tenantConfigs } = await import("../db/schema");
+  const captchaTenant = "sms-diagnostic-captcha";
+  await database.db.insert(tenants).values({
+    id: captchaTenant,
+    name: "SMS diagnostic captcha",
+    apiKeyHash: randomBytes(32).toString("hex"),
+  });
+  await database.db.insert(tenantConfigs).values({
+    tenantId: captchaTenant,
+    authAbuseConfig: {
+      captcha: {
+        enabled: true,
+        secretKeyEnv: "STEWARD_SMS_TEST_CAPTCHA_SECRET",
+      },
+    },
+  } as never);
+  const keys = [
+    "NODE_ENV",
+    "SMS_PROVIDER",
+    "STEWARD_SMS_SEND_GLOBAL_MAX_PER_HOUR",
+    "STEWARD_SMS_TEST_CAPTCHA_SECRET",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_FROM",
+    "TWILIO_VERIFY_SERVICE_SID",
+    "TWILIO_VERIFY_TOKEN_TTL_SECONDS",
+  ];
+  const saved = new Map(keys.map((key) => [key, process.env[key]]));
+  const errors = spyOn(logger, "error");
+  const observed: unknown[][] = [];
+  const check = async (
+    reason: string,
+    phone: string,
+    extra: object,
+    expectedError: string,
+  ) => {
+    errors.mockClear();
+    const response = await app.request(
+      "https://login.example.test/auth/sms/send",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-Id": reason },
+        body: JSON.stringify({ phone, tenantId, ...extra }),
+      },
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ ok: false, error: expectedError });
+    observed.push([
+      errors.mock.calls.filter(
+        (call) => call[1] === "[Login] SMS request failed",
+      ),
+      [{ reason, requestId: reason }, "[Login] SMS request failed"],
+    ]);
+    expect(JSON.stringify(errors.mock.calls)).not.toContain(phone);
+    expect(JSON.stringify(errors.mock.calls)).not.toContain(
+      "synthetic-captcha-token",
+    );
+    return response;
+  };
+  setDatabaseAuthRateLimiter(checkDatabaseAuthRateLimit);
+  try {
+    delete process.env.STEWARD_SMS_TEST_CAPTCHA_SECRET;
+    await check(
+      "sms_captcha_not_configured",
+      "+14155550201",
+      {
+        tenantId: captchaTenant,
+        captchaToken: "synthetic-captcha-token",
+      },
+      "CAPTCHA provider is not configured",
+    );
+
+    for (const key of keys) delete process.env[key];
+    process.env.NODE_ENV = "production";
+    releaseAuthStores();
+    await check(
+      "sms_provider_not_configured",
+      "+14155550202",
+      {},
+      "SMS provider not configured",
+    );
+
+    process.env.NODE_ENV = "test";
+    process.env.SMS_PROVIDER = "mock";
+    process.env.STEWARD_SMS_SEND_GLOBAL_MAX_PER_HOUR = "1";
+    releaseAuthStores();
+    const allowed = await post("/auth/sms/send", {
+      phone: "+14155550203",
+      tenantId,
+    });
+    expect(allowed.status).toBe(200);
+    const refused = await check(
+      "sms_send_budget_exhausted",
+      "+14155550204",
+      {},
+      "SMS verification is temporarily unavailable",
+    );
+    expect(Number(refused.headers.get("Retry-After"))).toBeGreaterThan(0);
+    for (const [calls, expected] of observed) expect(calls).toEqual([expected]);
+  } finally {
+    errors.mockRestore();
+    setDatabaseAuthRateLimiter(undefined);
+    releaseAuthStores();
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
 
 test("a verified linked phone signs into its existing email account", async () => {
   const { users, accounts } = await import("../db/schema-auth");

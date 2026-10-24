@@ -53,6 +53,10 @@ export function createLoginApp(): Hono<{ Variables: AppVariables }> {
       return c.json({ ok: false, error: error.message }, 400);
     }
     if (error instanceof SmsSendBudgetExceededError) {
+      logger.error(
+        { reason: "sms_send_budget_exhausted", requestId: c.get("requestId") },
+        "[Login] SMS request failed",
+      );
       c.header("Retry-After", String(error.retryAfterSecs));
       return c.json({ ok: false, error: error.message }, 503);
     }
@@ -60,6 +64,22 @@ export function createLoginApp(): Hono<{ Variables: AppVariables }> {
       error instanceof SmsDeliveryError ||
       error instanceof SmsVerificationError
     ) {
+      const deliveryReason =
+        error instanceof SmsDeliveryError ? error.reason : undefined;
+      logger.error(
+        {
+          reason:
+            deliveryReason === "sms_provider_rejected"
+              ? "sms_provider_rejected"
+              : deliveryReason === "sms_provider_unconfirmed"
+                ? "sms_provider_unconfirmed"
+                : error instanceof SmsDeliveryError
+                  ? "sms_delivery_failed"
+                  : "sms_verification_failed",
+          requestId: c.get("requestId"),
+        },
+        "[Login] SMS request failed",
+      );
       return c.json(
         { ok: false, error: "SMS verification is temporarily unavailable" },
         503,

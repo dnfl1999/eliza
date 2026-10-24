@@ -26,8 +26,17 @@ export class BlooioSmsProvider implements SmsProvider {
         text: body,
         idempotencyKey: randomUUID(),
       });
-      if (!result.success) throw new SmsDeliveryError();
-    } catch {
+      if (!result.success)
+        throw new SmsDeliveryError(
+          undefined,
+          result.error === "Blooio delivery was rejected"
+            ? "sms_provider_rejected"
+            : result.error === "Blooio acceptance could not be verified"
+              ? "sms_provider_unconfirmed"
+              : "sms_delivery_failed",
+        );
+    } catch (error) {
+      if (error instanceof SmsDeliveryError) throw error;
       throw new SmsDeliveryError();
     }
   }

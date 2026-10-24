@@ -43,7 +43,13 @@ export interface ManagedSmsOtpProvider {
  * propagate into thrown errors, logs, or API responses (SEC-061).
  */
 export class SmsDeliveryError extends Error {
-  constructor(message = "SMS delivery failed") {
+  constructor(
+    message = "SMS delivery failed",
+    readonly reason:
+      | "sms_delivery_failed"
+      | "sms_provider_rejected"
+      | "sms_provider_unconfirmed" = "sms_delivery_failed",
+  ) {
     super(message);
     this.name = "SmsDeliveryError";
   }
