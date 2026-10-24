@@ -1,11 +1,13 @@
-/** Real identity router and PGlite; only SMS delivery is captured locally. */
+/** Real HTTP identity service and PGlite; SMS delivery stays on loopback. */
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import type { createLoginApp } from "../app";
 import type { createPGLiteDb } from "../db/pglite";
 
 let app: ReturnType<typeof createLoginApp>;
+let service: ReturnType<typeof Bun.serve>;
 let database: Awaited<ReturnType<typeof createPGLiteDb>>;
+const httpFetch = globalThis.fetch;
 const previous = new Map<string, string | undefined>();
 const tenantId = "linked-phone-test";
 
@@ -41,9 +43,11 @@ beforeAll(async () => {
     .values({ tenantId, joinMode: "open" });
   const { createLoginApp } = await import("../app");
   app = createLoginApp();
+  service = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
 }, 60_000);
 
 afterAll(async () => {
+  if (service) await service.stop(true);
   if (database) await database.client.close();
   for (const [key, value] of previous) {
     if (value === undefined) delete process.env[key];
@@ -51,10 +55,14 @@ afterAll(async () => {
   }
 });
 
-function post(path: string, body: object) {
-  return app.request(`https://login.example.test${path}`, {
+function post(
+  path: string,
+  body: object,
+  headers: Record<string, string> = {},
+) {
+  return httpFetch(new URL(path, service.url), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -70,7 +78,9 @@ test("SMS send failures record a bounded cause and request ID without provider s
     STEWARD_SMS_SEND_GLOBAL_MAX_PER_HOUR: "0",
   };
   const saved = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
-  const secretBody = "synthetic-provider-secret OTP 654321 +14155550188";
+  const secretBody =
+    "synthetic-provider-secret OTP 654321 +14155550188 user@example.test Bearer synthetic-provider-token";
+  const requestToken = "synthetic-request-token";
   const sentCodes: string[] = [];
   let providerResponse = () => new Response(secretBody, { status: 429 });
   const provider = Bun.serve({
@@ -90,6 +100,7 @@ test("SMS send failures record a bounded cause and request ID without provider s
   }) as typeof fetch;
   const errors = spyOn(logger, "error");
   const warnings = spyOn(logger, "warn");
+  const information = spyOn(logger, "info");
   Object.assign(process.env, env);
   releaseAuthStores();
   const expected = [
@@ -114,16 +125,14 @@ test("SMS send failures record a bounded cause and request ID without provider s
         providerResponse = () => Response.json({ error: secretBody });
       if (index === 2) await provider.stop(true);
       errors.mockClear();
-      const requestId = `sms-diagnostic-${index}`;
-      const response = await app.request(
-        "https://login.example.test/auth/sms/send",
+      const suppliedRequestId =
+        index === 1 ? "invalid user@example.test" : `sms-diagnostic-${index}`;
+      const response = await post(
+        "/auth/sms/send?private=synthetic-query-token",
+        { phone: `+1415555018${index}`, tenantId, captchaToken: requestToken },
         {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Request-Id": requestId,
-          },
-          body: JSON.stringify({ phone: `+1415555018${index}`, tenantId }),
+          "X-Request-Id": suppliedRequestId,
+          Authorization: `Bearer ${requestToken}`,
         },
       );
       expect(response.status).toBe(503);
@@ -131,7 +140,11 @@ test("SMS send failures record a bounded cause and request ID without provider s
         ok: false,
         error: "SMS verification is temporarily unavailable",
       });
-      expect(response.headers.get("X-Request-Id")).toBe(requestId);
+      const requestId = response.headers.get("X-Request-Id");
+      if (index === 1) {
+        expect(requestId).toMatch(/^[0-9a-f-]{36}$/u);
+        expect(requestId).not.toBe(suppliedRequestId);
+      } else expect(requestId).toBe(suppliedRequestId);
       observed.push([
         errors.mock.calls.filter(
           (call) => call[1] === "[Login] SMS request failed",
@@ -139,9 +152,38 @@ test("SMS send failures record a bounded cause and request ID without provider s
         { reason, requestId },
       ]);
       allCalls.push(...errors.mock.calls);
+      if (index === 0) {
+        expect(sentCodes).toHaveLength(2);
+        providerResponse = () => Response.json({ id: "local-retry-accepted" });
+        errors.mockClear();
+        const retried = await post("/auth/sms/send", {
+          phone: "+14155550180",
+          tenantId,
+        });
+        expect(retried.status).toBe(200);
+        expect((await retried.json()).ok).toBe(true);
+        expect(errors.mock.calls).toHaveLength(0);
+      }
     }
-    const allDiagnostics = JSON.stringify([allCalls, warnings.mock.calls]);
-    expect(sentCodes).toHaveLength(3);
+    errors.mockClear();
+    const invalid = await post("/auth/sms/send", {
+      phone: "invalid-phone",
+      tenantId,
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({
+      ok: false,
+      error: "phone must be E.164",
+    });
+    const unauthenticated = await httpFetch(new URL("/user/me", service.url));
+    expect(unauthenticated.status).toBe(401);
+    expect(errors.mock.calls).toHaveLength(0);
+    const allDiagnostics = JSON.stringify([
+      allCalls,
+      warnings.mock.calls,
+      information.mock.calls,
+    ]);
+    expect(sentCodes).toHaveLength(4);
     for (const code of sentCodes) expect(code).toMatch(/^\d{6}$/u);
     for (const secret of [
       env.BLOOIO_API_KEY,
@@ -149,6 +191,10 @@ test("SMS send failures record a bounded cause and request ID without provider s
       secretBody,
       "654321",
       "+1415555018",
+      "user@example.test",
+      "synthetic-provider-token",
+      requestToken,
+      "synthetic-query-token",
       ...sentCodes,
     ])
       expect(allDiagnostics).not.toContain(secret);
@@ -157,6 +203,7 @@ test("SMS send failures record a bounded cause and request ID without provider s
   } finally {
     errors.mockRestore();
     warnings.mockRestore();
+    information.mockRestore();
     globalThis.fetch = originalFetch;
     await provider.stop(true);
     releaseAuthStores();
@@ -213,12 +260,11 @@ test("SMS configuration and send-budget failures have distinct request diagnosti
     expectedError: string,
   ) => {
     errors.mockClear();
-    const response = await app.request(
-      "https://login.example.test/auth/sms/send",
+    const response = await post(
+      "/auth/sms/send",
+      { phone, tenantId, ...extra },
       {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Request-Id": reason },
-        body: JSON.stringify({ phone, tenantId, ...extra }),
+        "X-Request-Id": reason,
       },
     );
     expect(response.status).toBe(503);
@@ -274,6 +320,27 @@ test("SMS configuration and send-budget failures have distinct request diagnosti
       "SMS verification is temporarily unavailable",
     );
     expect(Number(refused.headers.get("Retry-After"))).toBeGreaterThan(0);
+    process.env.STEWARD_SMS_SEND_GLOBAL_MAX_PER_HOUR = "0";
+    const limitedPhone = "+14155550205";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const allowed = await post("/auth/sms/send", {
+        phone: limitedPhone,
+        tenantId,
+      });
+      expect(allowed.status).toBe(200);
+    }
+    errors.mockClear();
+    const limited = await post("/auth/sms/send", {
+      phone: limitedPhone,
+      tenantId,
+    });
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toEqual({
+      ok: false,
+      error: "Too many requests. Please try again later.",
+    });
+    expect(Number(limited.headers.get("Retry-After"))).toBeGreaterThan(0);
+    expect(errors.mock.calls).toHaveLength(0);
     for (const [calls, expected] of observed) expect(calls).toEqual([expected]);
   } finally {
     errors.mockRestore();
@@ -500,7 +567,7 @@ test("the tenant switch route applies the target tenant's login methods", async 
     mfaVerifiedAt: Date.now(),
   });
   const switchTo = (tenantId: string) =>
-    app.request("https://login.example.test/user/me/tenants/switch", {
+    httpFetch(new URL("/user/me/tenants/switch", service.url), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
