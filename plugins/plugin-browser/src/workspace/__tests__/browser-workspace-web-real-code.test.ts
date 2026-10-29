@@ -63,6 +63,83 @@ describe("browser workspace web-mode real-code command flow", () => {
     await __resetBrowserWorkspaceStateForTests();
   });
 
+  it.each(["link", "submit", "disabled", "plain"])(
+    "activates a clicked descendant through its %s control without extra requests",
+    async (target) => {
+      const requests: { method: string; path: string; body: string }[] = [];
+      const server = createServer(async (request, response) => {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        requests.push({
+          method: request.method ?? "GET",
+          path: request.url ?? "/",
+          body,
+        });
+        response.setHeader("Content-Type", "text/html");
+        response.end(`<!doctype html><title>Descendant activation</title>
+          <a href="/details"><span id="link">View details</span></a>
+          <form method="post" action="/saved">
+            <input name="message" value="Keep this value">
+            <button name="action" value="save"><span id="submit">Save</span></button>
+            <button disabled><span id="disabled">Unavailable</span></button>
+            <span id="plain">Form description</span>
+          </form>`);
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error("No HTTP port");
+      const origin = `http://127.0.0.1:${address.port}`;
+      try {
+        const tab = await openBrowserWorkspaceTab(
+          { url: `${origin}/start` },
+          webEnv,
+        );
+        await executeBrowserWorkspaceCommand(
+          { id: tab.id, subaction: "get", selector: "title" },
+          webEnv,
+        );
+        const click = executeBrowserWorkspaceCommand(
+          { id: tab.id, subaction: "click", selector: `#${target}` },
+          webEnv,
+        );
+        if (target === "disabled")
+          await expect(click).rejects.toThrow("disabled");
+        else await click;
+        const expectedPath =
+          target === "link"
+            ? "/details"
+            : target === "submit"
+              ? "/saved"
+              : "/start";
+        const current = (await listBrowserWorkspaceTabs(webEnv)).find(
+          (entry) => entry.id === tab.id,
+        );
+        expect(current?.url).toBe(`${origin}${expectedPath}`);
+        expect(requests).toEqual([
+          { method: "GET", path: "/start", body: "" },
+          ...(target === "link"
+            ? [{ method: "GET", path: "/details", body: "" }]
+            : target === "submit"
+              ? [
+                  {
+                    method: "POST",
+                    path: "/saved",
+                    body: "message=Keep+this+value&action=save",
+                  },
+                ]
+              : []),
+        ]);
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    },
+  );
+
   it("keeps document fragments through real HTTP loads and form redirects", async () => {
     const requests: string[] = [];
     const server = createServer((request, response) => {

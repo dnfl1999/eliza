@@ -166,6 +166,12 @@ export async function activateWebBrowserWorkspaceElement(
   element: Element,
   subaction: "click" | "dblclick",
 ): Promise<BrowserWorkspaceCommandResult> {
+  // A click on text or an icon inside a link or button activates that control.
+  // Reuse its disabled check, navigation policy and submitter handling.
+  const activation = element.closest("a, button");
+  if (activation && activation !== element) {
+    return activateWebBrowserWorkspaceElement(tab, activation, subaction);
+  }
   if (element.matches(":disabled")) {
     throw new Error("Target element is disabled.");
   }
