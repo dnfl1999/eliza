@@ -63,7 +63,17 @@ describe("browser workspace web-mode real-code command flow", () => {
     await __resetBrowserWorkspaceStateForTests();
   });
 
-  it.each(["link", "submit", "disabled", "plain"])(
+  it.each([
+    "link",
+    "link-nested",
+    "link-svg",
+    "submit",
+    "submit-nested",
+    "submit-svg",
+    "disabled",
+    "disabled-fieldset",
+    "plain",
+  ])(
     "activates a clicked descendant through its %s control without extra requests",
     async (target) => {
       const requests: { method: string; path: string; body: string }[] = [];
@@ -77,11 +87,12 @@ describe("browser workspace web-mode real-code command flow", () => {
         });
         response.setHeader("Content-Type", "text/html");
         response.end(`<!doctype html><title>Descendant activation</title>
-          <a href="/details"><span id="link">View details</span></a>
+          <a href="/details"><span id="link">View details</span><b><em id="link-nested">Nested details</em></b><svg><g><path id="link-svg" d="M0 0H10V10Z"/></g></svg></a>
           <form method="post" action="/saved">
             <input name="message" value="Keep this value">
-            <button name="action" value="save"><span id="submit">Save</span></button>
+            <button name="action" value="save"><span id="submit">Save</span><strong><em id="submit-nested">Nested save</em></strong><svg><g><path id="submit-svg" d="M0 0H10V10Z"/></g></svg></button>
             <button disabled><span id="disabled">Unavailable</span></button>
+            <fieldset disabled><button><span id="disabled-fieldset">Unavailable fieldset</span></button></fieldset>
             <span id="plain">Form description</span>
           </form>`);
       });
@@ -105,24 +116,23 @@ describe("browser workspace web-mode real-code command flow", () => {
           { id: tab.id, subaction: "click", selector: `#${target}` },
           webEnv,
         );
-        if (target === "disabled")
+        if (target.startsWith("disabled"))
           await expect(click).rejects.toThrow("disabled");
         else await click;
-        const expectedPath =
-          target === "link"
-            ? "/details"
-            : target === "submit"
-              ? "/saved"
-              : "/start";
+        const expectedPath = target.startsWith("link")
+          ? "/details"
+          : target.startsWith("submit")
+            ? "/saved"
+            : "/start";
         const current = (await listBrowserWorkspaceTabs(webEnv)).find(
           (entry) => entry.id === tab.id,
         );
         expect(current?.url).toBe(`${origin}${expectedPath}`);
         expect(requests).toEqual([
           { method: "GET", path: "/start", body: "" },
-          ...(target === "link"
+          ...(target.startsWith("link")
             ? [{ method: "GET", path: "/details", body: "" }]
-            : target === "submit"
+            : target.startsWith("submit")
               ? [
                   {
                     method: "POST",
