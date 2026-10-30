@@ -63,6 +63,117 @@ describe("browser workspace web-mode real-code command flow", () => {
     await __resetBrowserWorkspaceStateForTests();
   });
 
+  it.each([
+    ["link", "Enter", "/details"],
+    ["link", "Space", "/start"],
+    ["submit", "Space", "/saved"],
+    ["submit", "Enter", "/saved"],
+    ["input-submit", "Space", "/saved"],
+    ["ordinary", "Space", "/start"],
+    ["reset", "Space", "/start"],
+    ["disabled", "Space", "/start"],
+    ["fieldset-disabled", "Space", "/start"],
+    ["plain", "Enter", "/start"],
+  ])(
+    "activates %s with %s through the keyboard command",
+    async (target, key, expectedPath) => {
+      const requests: { method: string; path: string; body: string }[] = [];
+      const server = createServer(async (request, response) => {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        requests.push({
+          method: request.method ?? "GET",
+          path: request.url ?? "/",
+          body,
+        });
+        response.setHeader("Content-Type", "text/html");
+        response.end(`<!doctype html><title>Keyboard activation</title>
+        <a id="link" href="/details">Details</a>
+        <form method="post" action="/saved">
+          <input id="message" name="message" value="Original">
+          <button id="submit" name="action" value="save">Save</button>
+          <input id="input-submit" type="submit" name="action" value="save">
+          <button id="ordinary" type="button">Ordinary</button>
+          <button id="reset" type="reset">Reset</button>
+          <button id="disabled" disabled>Unavailable</button>
+          <fieldset disabled><button id="fieldset-disabled">Unavailable</button></fieldset>
+          <span id="plain">Description</span>
+        </form>`);
+      });
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error("No HTTP port");
+      const origin = `http://127.0.0.1:${address.port}`;
+      try {
+        const tab = await openBrowserWorkspaceTab(
+          { url: `${origin}/start` },
+          webEnv,
+        );
+        await executeBrowserWorkspaceCommand(
+          { id: tab.id, subaction: "get", selector: "title" },
+          webEnv,
+        );
+        if (target === "reset")
+          await executeBrowserWorkspaceCommand(
+            {
+              id: tab.id,
+              subaction: "fill",
+              selector: "#message",
+              value: "Edited",
+            },
+            webEnv,
+          );
+        const command = executeBrowserWorkspaceCommand(
+          { id: tab.id, subaction: "press", selector: `#${target}`, key },
+          webEnv,
+        );
+        if (target.includes("disabled"))
+          await expect(command).rejects.toThrow("disabled");
+        else expect((await command).subaction).toBe("press");
+        expect(
+          (await listBrowserWorkspaceTabs(webEnv)).find(
+            (entry) => entry.id === tab.id,
+          )?.url,
+        ).toBe(`${origin}${expectedPath}`);
+        expect(requests).toEqual([
+          { method: "GET", path: "/start", body: "" },
+          ...(expectedPath === "/details"
+            ? [{ method: "GET", path: "/details", body: "" }]
+            : expectedPath === "/saved"
+              ? [
+                  {
+                    method: "POST",
+                    path: "/saved",
+                    body: "message=Original&action=save",
+                  },
+                ]
+              : []),
+        ]);
+        if (target === "reset")
+          expect(
+            (
+              await executeBrowserWorkspaceCommand(
+                {
+                  id: tab.id,
+                  subaction: "get",
+                  selector: "#message",
+                  getMode: "value",
+                },
+                webEnv,
+              )
+            ).value,
+          ).toBe("Original");
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    },
+  );
+
   it("keeps document fragments through real HTTP loads and form redirects", async () => {
     const requests: string[] = [];
     const server = createServer((request, response) => {

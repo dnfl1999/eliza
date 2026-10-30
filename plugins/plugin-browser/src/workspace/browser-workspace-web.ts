@@ -1375,12 +1375,13 @@ export async function executeWebBrowserWorkspaceDomCommand(
           return { mode: "web", subaction: command.subaction, value: { key } };
         }
         if (
-          key === "Enter" &&
-          (element?.tagName === "BUTTON" ||
-            (element?.tagName === "INPUT" &&
-              ["submit", "image", "button", "reset"].includes(
-                (element as HTMLInputElement).type,
-              )))
+          ((key === "Enter" || key === "Space") &&
+            (element?.tagName === "BUTTON" ||
+              (element?.tagName === "INPUT" &&
+                ["submit", "image", "button", "reset"].includes(
+                  (element as HTMLInputElement).type,
+                )))) ||
+          (key === "Enter" && element?.tagName === "A")
         ) {
           const result = await activateWebBrowserWorkspaceElement(
             tab,
