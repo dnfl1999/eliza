@@ -66,6 +66,11 @@ jobs:
       run: bun --no-env-file run postinstall
     - name: Build core dependency graph
       run: bun --no-env-file run build:core
+    - name: Install the missing loopback Redis prerequisite
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends redis-server
+        redis-server --version
     - name: Record loopback prerequisites
       run: 'command -v redis-server || true
 
