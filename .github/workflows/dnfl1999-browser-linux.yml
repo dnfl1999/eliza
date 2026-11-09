@@ -1,0 +1,143 @@
+name: dnfl1999 browser Linux validation
+on:
+  push:
+    branches:
+      - validation/browser-linux-20261109-02
+permissions:
+  contents: read
+env:
+  CI: "true"
+  BUN_VERSION: 1.4.2
+  NODE_VERSION: 24.15.0
+  NODE_OPTIONS: --max-old-space-size=4096
+  RUN_TURBO_CONCURRENCY: "1"
+  ELIZA_SKIP_FUSED_INFERENCE_SETUP: "1"
+  ELIZA_NO_VISION_DEPS: "1"
+  SKIP_AVATAR_CLONE: "1"
+jobs:
+  browser:
+    if: github.repository == 'dnfl1999/eliza'
+    runs-on: ubuntu-24.04
+    strategy: &a1
+      fail-fast: false
+      matrix:
+        include:
+          - candidate: click
+            revision: 16074068ee2b083b01e03eb4772772e903a93e77
+            model: DescendantActivation
+          - candidate: keyboard
+            revision: 640ce1025f785f7046cc9b4ba4a77a7a597f18cf
+            model: KeyboardActivation
+    env: &a2
+      CANDIDATE_SHA: ${{ matrix.revision }}
+      MODEL: ${{ matrix.model }}
+    timeout-minutes: 90
+    steps:
+      - &a3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.revision }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+      - &a4
+        name: Bind checks to candidate
+        run: |-
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          uname -a
+          git rev-parse HEAD
+          git status --short
+      - &a5
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+      - &a6
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.2
+      - &a7
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install browser and root tools from the frozen lock
+        run: |-
+          bun --no-env-file install --frozen-lockfile --ignore-scripts --filter eliza --filter '@elizaos/plugin-browser'
+          git diff --exit-code
+      - name: Complete browser Vitest suite
+        working-directory: plugins/plugin-browser
+        run: node --conditions=eliza-source --import ../../node_modules/tsx/dist/loader.mjs node_modules/vitest/vitest.mjs run --maxWorkers=1
+      - name: Remote control integration suite
+        if: success() || failure()
+        working-directory: plugins/plugin-browser
+        run: bun --no-env-file run test:remote-control
+      - name: Browser typecheck
+        if: success() || failure()
+        working-directory: plugins/plugin-browser
+        run: bun --no-env-file run typecheck
+      - name: Browser lint
+        if: success() || failure()
+        working-directory: plugins/plugin-browser
+        run: bun --no-env-file run lint:check
+      - name: Exhaustive activation safety and progress with real HTTP conformance
+        if: success() || failure()
+        run: bun --no-env-file run test:quint "$MODEL"
+      - &a8
+        name: Record exact source and verification receipts
+        if: always()
+        run: |-
+          git rev-parse HEAD
+          git diff --exit-code -- plugins/plugin-browser/src/workspace/browser-workspace-forms.ts plugins/plugin-browser/src/workspace/browser-workspace-web.ts plugins/plugin-browser/src/workspace/__tests__/browser-workspace-web-real-code.test.ts plugins/plugin-browser/quint
+          sha256sum plugins/plugin-browser/src/workspace/browser-workspace-forms.ts plugins/plugin-browser/src/workspace/browser-workspace-web.ts plugins/plugin-browser/src/workspace/__tests__/browser-workspace-web-real-code.test.ts
+          git status --short
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          for (const file of ['test-results/quint/verification.json']) if (fs.existsSync(file)) console.log('QUINT_RECEIPT '+file+' '+fs.readFileSync(file,'utf8'));
+          NODE
+  repository:
+    if: github.repository == 'dnfl1999/eliza'
+    runs-on: ubuntu-24.04
+    strategy: *a1
+    env: *a2
+    timeout-minutes: 180
+    services:
+      quint-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: qa_quint
+          POSTGRES_DB: quint_protocol
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: --health-cmd "pg_isready -h 127.0.0.1 -U qa_quint -d quint_protocol" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - *a3
+      - *a4
+      - *a5
+      - *a6
+      - *a7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: packages/os/native/ota-trust/go.mod
+          cache: false
+      - name: Install all frozen workspace dependencies
+        run: |-
+          bun --no-env-file install --frozen-lockfile --ignore-scripts
+          git diff --exit-code
+      - name: Run reviewed repository postinstall
+        run: bun --no-env-file run postinstall
+      - name: Build core dependency graph
+        run: bun --no-env-file run build:core
+      - name: Complete required repository verification
+        if: success() || failure()
+        run: bun --no-env-file run verify
+      - name: Repository formatting
+        if: success() || failure()
+        run: bun --no-env-file run format:check
+      - name: All application state models and implementation hooks
+        if: success() || failure()
+        env:
+          INFERENCE_POLICY_TEST_POSTGRES_URL: postgresql://qa_quint@127.0.0.1:5432/quint_protocol
+        run: bun --no-env-file run test:quint
+      - *a8
