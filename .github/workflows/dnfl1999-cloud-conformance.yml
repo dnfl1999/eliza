@@ -1,0 +1,83 @@
+name: dnfl1999 isolated upstream Stripe conformance
+'on':
+  push:
+    branches:
+    - validation/cloud-conformance-20261109-06
+permissions:
+  contents: read
+concurrency:
+  group: dnfl1999-cloud-conformance-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CI: 'true'
+  BUN_VERSION: 1.4.2
+  NODE_VERSION: 24.15.0
+  NODE_OPTIONS: --max-old-space-size=4096
+  RUN_TURBO_CONCURRENCY: '1'
+  ELIZA_SKIP_FUSED_INFERENCE_SETUP: '1'
+  ELIZA_NO_VISION_DEPS: '1'
+  SKIP_AVATAR_CLONE: '1'
+jobs:
+  cloud:
+    if: github.repository == 'dnfl1999/eliza'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CANDIDATE_SHA: bd935168a4e8f24639957cc61c37f9ab2ffa54b9
+      INFERENCE_POLICY_TEST_POSTGRES_URL: postgresql://qa_quint@127.0.0.1:5432/quint_protocol
+    services:
+      quint-postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: qa_quint
+          POSTGRES_DB: quint_protocol
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+        - 127.0.0.1:5432:5432
+        options: --health-cmd "pg_isready -h 127.0.0.1 -U qa_quint -d quint_protocol" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: bd935168a4e8f24639957cc61c37f9ab2ffa54b9
+        fetch-depth: 1
+        persist-credentials: false
+        submodules: false
+    - name: Bind checks to candidate
+      run: 'test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+        uname -a
+
+        git rev-parse HEAD
+
+        git status --short'
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+      with:
+        node-version: 24.15.0
+        package-manager-cache: false
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+      with:
+        bun-version: 1.4.2
+        no-cache: true
+    - name: Install all frozen workspace dependencies
+      run: 'bun --no-env-file install --frozen-lockfile --ignore-scripts
+
+        git diff --exit-code'
+    - name: Run reviewed repository postinstall
+      run: bun --no-env-file run postinstall
+    - name: Build core dependency graph
+      run: bun --no-env-file run build:core
+    - name: Record loopback prerequisites
+      run: 'command -v redis-server || true
+
+        redis-server --version || true
+
+        node --version
+
+        bun --version
+
+        git status --short'
+    - name: Run exact upstream Stripe legacy conformance
+      run: node packages/cloud/quint/check-stripe-legacy-adoption.mjs
+    - name: Retain bounded conformance logs
+      if: always()
+      run: "node --input-type=module <<'NODE'\nimport fs from 'node:fs';\nimport path from 'node:path';\nconst root='test-results/quint-stripe-legacy-adoption';\nfunction walk(dir){\n if(!fs.existsSync(dir))return;\n for(const e of fs.readdirSync(dir,{withFileTypes:true})){\n  const file=path.join(dir,e.name);\n  if(e.isDirectory())walk(file);\n  else if(e.isFile()&&/\\.(log|xml|json)$/.test(e.name)){\n   const data=fs.readFileSync(file,'utf8');\n   console.log('CONFORMANCE_FILE '+file+' '+JSON.stringify({bytes:Buffer.byteLength(data),tail:data.slice(-64000)}));\n  }\n }\n}\nwalk(root);\nNODE\ngit diff --exit-code"
