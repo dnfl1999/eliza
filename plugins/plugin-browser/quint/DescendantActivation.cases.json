@@ -1,0 +1,42 @@
+{
+  "sources": [
+    "plugins/plugin-browser/src/workspace/browser-workspace-forms.ts",
+    "plugins/plugin-browser/src/workspace/browser-workspace-web.ts",
+    "plugins/plugin-browser/src/workspace/__tests__/browser-workspace-web-real-code.test.ts"
+  ],
+  "conformance": "plugins/plugin-browser/quint/check-descendant-activation.mjs",
+  "bounds": "9 fixture cases, one command, four phases, zero or one HTTP effect.",
+  "limitations": [
+    "This is a bounded projection of one existing web-mode command, not a complete browser model or a proof of implementation refinement.",
+    "One selected element, one command, one loaded loopback page and at most one HTTP effect after the initial load. The implementation hook checks real GET/POST requests, payload, tab URL and disabled errors in the existing fixture.",
+    "The transport and tab/history owners are abstracted at command completion. HTTP completion, policy allow and absence of concurrent commands are assumptions; transport failure, cancellation, restart, cross-tab races, native profiles and policy decisions remain outside this model.",
+    "The change does not add persistence or retry state. Existing URL and effect policy checks remain in browser-workspace-forms.ts; separate policy integration checks are still required.",
+    "Arbitrary DOM structures, event handlers, invalid nested interactive elements and text-input implicit submission are not enumerated by these finite fixture cases."
+  ],
+  "cases": [
+    {
+      "name": "fixture-activation",
+      "main": "DescendantActivation",
+      "init": "init",
+      "step": "step",
+      "invariants": [
+        "Bounded",
+        "NoEarlyEffect",
+        "CorrectOwner",
+        "CorrectOutcome"
+      ],
+      "temporal": ["ActivationProgress"],
+      "temporalChecks": [
+        {
+          "property": "ActivationProgress",
+          "expect": "holds",
+          "assumptions": [
+            "Weak fairness of resolve and complete after selection. Completion abstracts an allowed loopback request that finishes; it does not prove scheduler or network progress."
+          ]
+        }
+      ],
+      "maxSteps": 20,
+      "samples": 1000
+    }
+  ]
+}
